@@ -31,6 +31,7 @@ namespace gltfio {
 
 struct FFilamentAsset;
 class AssetPool;
+class TextureProviders;
 
 /**
  * \struct ResourceConfiguration ResourceLoader.h gltfio/ResourceLoader.h
@@ -150,6 +151,14 @@ public:
      * and cancellation is required before progress reaches 100%.
      */
     void asyncCancelLoad();
+
+    /**
+     * Adds a custom "provider" that can create and populate filament Texture objects.
+     *
+     * Calling this method is not necessary in some build configurations.
+     * Destruction of the given provider is the client's responsibility.
+     */
+    void addTextureProvider(const char* mimeType, TextureProvider* provider);
 
 private:
     bool loadResources(FFilamentAsset* asset, bool async);

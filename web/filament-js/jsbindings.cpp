@@ -64,7 +64,6 @@
 #include <gltfio/AssetLoader.h>
 #include <gltfio/FilamentAsset.h>
 #include <gltfio/FilamentInstance.h>
-#include <gltfio/Image.h>
 #include <gltfio/MaterialProvider.h>
 #include <gltfio/ResourceLoader.h>
 
