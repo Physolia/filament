@@ -16,6 +16,11 @@
 
 #include "TextureProvider.h"
 
+#include <string>
+#include <vector>
+
+#include <utils/JobSystem.h>
+
 #include <filament/Engine.h>
 #include <filament/Texture.h>
 
@@ -27,59 +32,126 @@
 #define STBI_NO_PIC
 #define STBI_NO_PNM
 
-// For emscripten and Android builds, we never load from the file
-// system, so we-opt out of the stdio functionality in stb.
-#if defined(__EMSCRIPTEN__) || defined(__ANDROID__)
 #define STBI_NO_STDIO
-#endif
-
 #define STB_IMAGE_IMPLEMENTATION
 
 #include <stb_image.h>
 
 using namespace filament;
+using namespace utils;
+
+using std::string;
 
 namespace gltfio {
 
+static const auto FREE_CALLBACK = [](void* mem, size_t, void*) { free(mem); };
+
 class StbProvider : public TextureProvider {
 public:
-
     StbProvider(Engine* engine) : mEngine(engine) {}
 
-    Texture* createTexture(const char* mimeType, const char* resourceUri) final;
+    Texture* pushTexture(const uint8_t* data, size_t byteCount,
+            const char* mimeType, uint64_t flags) final;
 
-    Texture* createTexture(const char* mimeType, const uint8_t* data, size_t byteCount) final;
+    Texture* popTexture() final;
 
-    float getProgress() const final;
+    const char* getFailureMessage() const final { return mErrorMessage.c_str(); }
 
-    void update() final;
+    size_t getRemainingCount() const { return mDecodingCount; }
 
-    void wait() final;
+    size_t getTotalCount() const { return mTextures.size(); }
+
+    void updateQueue() final;
+
+    void waitForCompletion() final;
 
 private:
+    enum class TextureState {
+        DECODING, // Texture has been pushed, mipmap levels are not yet complete.
+        READY,    // Mipmap levels are available but texture has not been popped yet.
+        POPPED,   // Client has popped the texture from the queue.
+    };
+
+    struct TextureInfo {
+        Texture* texture;
+        TextureState state;
+        std::atomic<uint8_t*> decodedTexelsBaseMipmap;
+    };
+
+    void decodeSingleTexture();
+
+    // Number of textures that are in the DECODING state.
+    size_t mDecodingCount = 0;
+
+    // size_t mDecoderTasksCount;
+    // size_t mDecoderTasksFinishedCount;
+
+    std::vector<TextureInfo> mTextures;
+
+    JobSystem::Job* mDecoderRootJob = nullptr;
+    std::string mErrorMessage;
     Engine* const mEngine;
 };
 
-Texture* StbProvider::createTexture(const char* mimeType, const char* resourceUri) {
-    //
+Texture* StbProvider::pushTexture(const uint8_t* data, size_t byteCount,
+            const char* mimeType, FlagBits flags) {
+    int width, height, numComponents;
+    if (!stbi_info_from_memory(data, byteCount, &width, &height, &numComponents)) {
+        mErrorMessage = string("Unable to parse texture: ") + stbi_failure_reason();
+        return nullptr;
+    }
+
+    using InternalFormat = Texture::InternalFormat;
+    const FlagBits sRGB = FlagBits(Flags::sRGB);
+
+    Texture* texture = Texture::Builder()
+            .width(width)
+            .height(height)
+            .levels(0xff)
+            .format((flags & sRGB) ? InternalFormat::SRGB8_A8 : InternalFormat::RGBA8)
+            .build(*mEngine);
+
+    if (texture == nullptr) {
+        mErrorMessage = "Unable to build Texture object.";
+        return nullptr;
+    }
+
+    #error TODO: create jobs and push to queue
+
+    return texture;
+}
+
+Texture* StbProvider::popTexture() {
+    for (TextureInfo& texture : mTextures) {
+        if (texture.state == TextureState::READY) {
+            texture.state = TextureState::POPPED;
+            return texture.texture;
+        }
+    }
     return nullptr;
 }
 
-Texture* StbProvider::createTexture(const char* mimeType, const uint8_t* data, size_t byteCount) {
-    //
-    return nullptr;
+void StbProvider::updateQueue() {
+    if (!UTILS_HAS_THREADING) {
+        decodeSingleTexture();
+    }
+    for (TextureInfo& info : mTextures) {
+        if (info.state != TextureState::DECODING) {
+            continue;
+        }
+        Texture* texture = info.texture;
+        if (uint8_t* data = info.decodedTexelsBaseMipmap.load()) {
+            Texture::PixelBufferDescriptor pbd(data,
+                    texture->getWidth() * texture->getHeight() * 4,
+                    Texture::Format::RGBA, Texture::Type::UBYTE, FREE_CALLBACK);
+            texture->setImage(*mEngine, 0, std::move(pbd));
+            texture->generateMipmaps(*mEngine);
+            info.state = TextureState::READY;
+        }
+    }
 }
 
-float StbProvider::getProgress() const {
-    //
-    return 0.0f;
-}
-
-void StbProvider::update() {
-    //
-}
-
-void StbProvider::wait() {
+void StbProvider::waitForCompletion() {
     //
 }
 

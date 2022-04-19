@@ -64,6 +64,8 @@ static const auto FREE_CALLBACK = [](void* mem, size_t, void*) { free(mem); };
 
 namespace gltfio {
 
+using BufferTextureCache = tsl::robin_map<const void*, Texture*>;
+using FilepathTextureCache = tsl::robin_map<std::string, Texture*>;
 using UriDataCache = tsl::robin_map<std::string, gltfio::ResourceLoader::BufferDescriptor>;
 using TextureProviderList = tsl::robin_map<std::string, TextureProvider*>;
 
@@ -82,9 +84,9 @@ struct ResourceLoader::Impl {
     bool mIgnoreBindTransform;
     std::string mGltfPath;
 
-    // This is used to calculate skinIndex when updateBoundingBoxes, so that the correspondency between
+    // This is used to calculate skinIndex when updateBoundingBoxes, so that the mapping between
     // cgltf_node* and FFilamentInstance::Skin can be retrieved. This pointer doesn't need to be freed.
-    cgltf_skin* cgltfSkinBaseAddress;
+    cgltf_skin* mSkinBaseAddress;
 
     // User-provided resource data with URI string keys, populated with addResourceData().
     // This is used on platforms without traditional file systems, such as Android, iOS, and WebGL.
@@ -93,13 +95,16 @@ struct ResourceLoader::Impl {
     // User-provided mapping from mime types to texture providers.
     TextureProviderList mTextureProviders;
 
+    // Avoid duplicated Texture objects via caches with two key types: buffer pointers and strings.
+    BufferTextureCache mBufferTextureCache;
+    FilepathTextureCache mFilepathTextureCache;
+
     FFilamentAsset* mCurrentAsset = nullptr;
 
     void computeTangents(FFilamentAsset* asset);
     bool createTextures(bool async);
     void cancelTextureDecoding();
-    void addTextureCacheEntry(const TextureSlot& tb);
-    void bindTextureToMaterial(const TextureSlot& tb);
+    void getOrCreateTexture(const TextureSlot& tb);
     ~Impl();
 };
 
@@ -370,7 +375,8 @@ bool ResourceLoader::loadResources(FFilamentAsset* asset, bool async) {
         if (strncmp(uri, "data:", 5) == 0) {
             const char* comma = strchr(uri, ',');
             if (comma && comma - uri >= 7 && strncmp(comma - 7, ";base64", 7) == 0) {
-                cgltf_result res = cgltf_load_buffer_base64(&options, gltf->buffers[i].size, comma + 1, &gltf->buffers[i].data);
+                cgltf_result res = cgltf_load_buffer_base64(&options, gltf->buffers[i].size,
+                        comma + 1, &gltf->buffers[i].data);
                 if (res != cgltf_result_success) {
                     slog.e << "Unable to load " << uri << io::endl;
                     return false;
@@ -446,7 +452,7 @@ bool ResourceLoader::loadResources(FFilamentAsset* asset, bool async) {
         if (!pImpl->mIgnoreBindTransform) {
             pImpl->mIgnoreBindTransform = asset->isInstanced();
         }
-        pImpl->cgltfSkinBaseAddress = &gltf->skins[0];
+        pImpl->mSkinBaseAddress = &gltf->skins[0];
         updateBoundingBoxes(asset);
     }
 
@@ -539,26 +545,36 @@ float ResourceLoader::asyncGetLoadProgress() const {
     if (pImpl->mTextureProviders.empty()) {
         return 0;
     }
-    float progress = 0;
+    size_t total = 0;
+    size_t remaining = 0;
     for (const auto& iter : pImpl->mTextureProviders) {
-        progress += iter.second->getProgress();
+        total += iter.second->getTotalCount();
+        remaining += iter.second->getRemainingCount();
     }
-    return progress / pImpl->mTextureProviders.size();
+    return total == 0 ? 0 : (1.0f - remaining / total);
 }
 
 void ResourceLoader::asyncUpdateLoad() {
     for (const auto& iter : pImpl->mTextureProviders) {
-        iter.second->update();
+        iter.second->updateQueue();
+        while (Texture* texture = iter.second->popTexture()) {
+
+        }
     }
 }
 
-void ResourceLoader::Impl::addTextureCacheEntry(const TextureSlot& tb) {
+void ResourceLoader::Impl::getOrCreateTexture(const TextureSlot& tb) {
     const cgltf_texture* srcTexture = tb.texture;
     const cgltf_buffer_view* bv = srcTexture->image->buffer_view;
     const char* uri = srcTexture->image->uri;
     const uint32_t totalSize = uint32_t(bv ? bv->size : 0);
     void** data = bv ? &bv->buffer->data : nullptr;
     const size_t offset = bv ? bv->offset : 0;
+    TextureProvider::FlagBits flags = {};
+
+    if (tb.srgb) {
+        flags |= int(TextureProvider::Flags::sRGB);
+    }
 
     std::string mimeKey;
     size_t dataUriSize;
@@ -566,72 +582,67 @@ void ResourceLoader::Impl::addTextureCacheEntry(const TextureSlot& tb) {
     const char* mimeString = mimeKey.c_str();
 
     TextureProvider* provider = mTextureProviders[mimeKey];
-
     if (!provider) {
         slog.e << "Missing texture provider for " << mimeKey << io::endl;
         return;
     }
 
+    Texture* texture = nullptr;
+
     // Check if the texture binding uses BufferView data (i.e. it does not have a URI).
     if (data) {
         const uint8_t* sourceData = offset + (const uint8_t*) *data;
-        Texture* texture = provider->createTexture(mimeString, tb.srgb, sourceData, totalSize);
-        if (!texture) {
-            slog.e << "Unable to decode BufferView texture: " <<
-                    provider->getFailureMessage() << io::endl;
+        if (mBufferTextureCache.count(sourceData) > 0) {
             return;
         }
-        mCurrentAsset->bindTexture(tb, texture);
-        return;
+        texture = provider->pushTexture(sourceData, totalSize, mimeString, flags);
+        mBufferTextureCache[sourceData] = texture;
     }
 
     // Check if this is a data URI.
-    if (dataUriContent) {
-        Texture* texture = provider->createTexture(mimeString, tb.srgb, dataUriContent,
-                dataUriSize);
-        free((void*)dataUriContent);
-        if (!texture) {
-            slog.e << "Unable to decode data URI texture: " <<
-                    provider->getFailureMessage() << io::endl;
+    else if (dataUriContent) {
+        if (mBufferTextureCache.count(uri)) {
             return;
         }
-        mCurrentAsset->bindTexture(tb, texture);
-        return;
+        texture = provider->pushTexture(dataUriContent, dataUriSize, mimeString, flags);
+        free((void*)dataUriContent);
+        mBufferTextureCache[uri] = texture;
     }
 
     // Check the user-supplied resource cache for this URI.
-    auto iter = mUriDataCache.find(uri);
-    if (iter != mUriDataCache.end()) {
+    else if (auto iter = mUriDataCache.find(uri); iter != mUriDataCache.end()) {
         const uint8_t* sourceData = (const uint8_t*) iter->second.buffer;
-        Texture* texture = provider->createTexture(mimeString, tb.srgb, sourceData,
-                iter->second.size);
-        if (!texture) {
-            slog.e << "Unable to decode user-supplied texture data: " <<
-                    provider->getFailureMessage() << io::endl;
+        if (mBufferTextureCache.count(sourceData)) {
             return;
         }
-        mCurrentAsset->bindTexture(tb, texture);
-        return;
+        texture = provider->pushTexture(sourceData, iter->second.size, mimeString, flags);
+        mBufferTextureCache[sourceData] = texture;
     }
 
     // Finally, try the file system.
-    #if !USE_FILESYSTEM
-        slog.e << "Unable to load texture: " << uri << io::endl;
-    #else
-        Path fullpath = Path(mGltfPath).getParent() + uri;
-        Texture* texture = provider->createTexture(mimeString, tb.srgb, fullpath.c_str());
-        if (!texture) {
-            slog.e << "Unable to decode file-based texture data: " <<
-                    provider->getFailureMessage() << io::endl;
+    else if constexpr (USE_FILESYSTEM) {
+        if (mFilepathTextureCache.count(uri)) {
             return;
         }
-        mCurrentAsset->bindTexture(tb, texture);
-    #endif
+        Path fullpath = Path(mGltfPath).getParent() + uri;
+        assert(false && "TBD: file-based reading");
+        // texture = provider->pushTexture(data, size, mimeString, flags);
+        // free(data);
+        mFilepathTextureCache[uri] = texture;
+    }
+
+    if (!texture) {
+        slog.e << "Unable to decode texture data: " << provider->getFailureMessage() << io::endl;
+        return;
+    }
+
+    mCurrentAsset->bindTexture(tb, texture);
+    mCurrentAsset->takeOwnership(texture);
 }
 
 void ResourceLoader::Impl::cancelTextureDecoding() {
     for (const auto& iter : mTextureProviders) {
-        iter.second->wait();
+        iter.second->waitForCompletion();
     }
     mCurrentAsset = nullptr;
 }
@@ -639,18 +650,13 @@ void ResourceLoader::Impl::cancelTextureDecoding() {
 bool ResourceLoader::Impl::createTextures(bool async) {
     // If any decoding jobs are still underway, wait for them to finish.
     for (const auto& iter : mTextureProviders) {
-        iter.second->wait();
+        iter.second->waitForCompletion();
     }
 
     // First, determine texture dimensions and create texture cache entries.
     FFilamentAsset* asset = mCurrentAsset;
     for (auto slot : asset->mTextureSlots) {
-        addTextureCacheEntry(slot);
-    }
-
-    // Bind the textures to material instances.
-    for (auto slot : asset->mTextureSlots) {
-        bindTextureToMaterial(slot);
+        getOrCreateTexture(slot);
     }
 
     // Before creating jobs for PNG / JPEG decoding, we might need to return early. On single
@@ -666,7 +672,7 @@ bool ResourceLoader::Impl::createTextures(bool async) {
     }
 
     for (const auto& iter : mTextureProviders) {
-        iter.second->wait();
+        iter.second->waitForCompletion();
     }
 
     mCurrentAsset = asset;
@@ -768,7 +774,7 @@ void ResourceLoader::Impl::computeTangents(FFilamentAsset* asset) {
 
 ResourceLoader::Impl::~Impl() {
     for (const auto& iter : mTextureProviders) {
-        iter.second->wait();
+        iter.second->waitForCompletion();
     }
 }
 
@@ -874,15 +880,18 @@ void ResourceLoader::updateBoundingBoxes(FFilamentAsset* asset) const {
         for (cgltf_size slot = 0; slot < prim->attributes_count; slot++) {
             const cgltf_attribute& attr = prim->attributes[slot];
             const cgltf_accessor* accessor = attr.data;
-            if (attr.type == cgltf_attribute_type_position && cgltf_num_components(accessor->type) >= posAttrSize) {
+            if (attr.type == cgltf_attribute_type_position &&
+                    cgltf_num_components(accessor->type) >= posAttrSize) {
                 verts.resize(accessor->count * posAttrSize);
                 cgltf_accessor_unpack_floats(accessor, &verts[0], accessor->count * posAttrSize);
             }
-            if (attr.type == cgltf_attribute_type_joints && cgltf_num_components(accessor->type) >= skinningAttrSize) {
+            if (attr.type == cgltf_attribute_type_joints &&
+                    cgltf_num_components(accessor->type) >= skinningAttrSize) {
                 rawJoints.resize(accessor->count * skinningAttrSize);
                 cgltf_accessor_unpack_floats(accessor, &rawJoints[0], accessor->count * skinningAttrSize);
             }
-            if (attr.type == cgltf_attribute_type_weights && cgltf_num_components(accessor->type) >= skinningAttrSize) {
+            if (attr.type == cgltf_attribute_type_weights &&
+                    cgltf_num_components(accessor->type) >= skinningAttrSize) {
                 weights.resize(accessor->count * skinningAttrSize);
                 cgltf_accessor_unpack_floats(accessor, &weights[0], accessor->count * skinningAttrSize);
             }
@@ -905,7 +914,8 @@ void ResourceLoader::updateBoundingBoxes(FFilamentAsset* asset) const {
                 if (!pImpl->mNormalizeSkinningWeights) {
                     skinMatrix /= skinMatrix[3].w;
                 }
-                float3 skinnedPoint = (point.x * skinMatrix[0] + point.y * skinMatrix[1] + point.z * skinMatrix[2] + skinMatrix[3]).xyz;
+                float3 skinnedPoint = (point.x * skinMatrix[0] +
+                        point.y * skinMatrix[1] + point.z * skinMatrix[2] + skinMatrix[3]).xyz;
                 aabb.min = min(aabb.min, skinnedPoint);
                 aabb.max = max(aabb.max, skinnedPoint);
             }
@@ -913,7 +923,7 @@ void ResourceLoader::updateBoundingBoxes(FFilamentAsset* asset) const {
         *result = aabb;
     };
 
-    // Collect all mesh primitives that we wish to find bounds for. For each mesh primitive, we also 
+    // Collect all mesh primitives that we wish to find bounds for. For each mesh primitive, we also
     // collect the skin it bound to (nullptr if not skinned) for bounds computation.
     std::vector<std::pair<cgltf_primitive*, const Skin*>> primitives;
     for (auto iter : nodeMap) {
@@ -922,7 +932,7 @@ void ResourceLoader::updateBoundingBoxes(FFilamentAsset* asset) const {
         if (cgltfSkin) {
             // importSkins unpacked cgltfSkin into FFilamentInstance::SkinVector bijectively so that
             // the unpacked Skin can be retrieved given cgltfSkin index
-            int skinIndex = cgltfSkin - pImpl->cgltfSkinBaseAddress;
+            int skinIndex = cgltfSkin - pImpl->mSkinBaseAddress;
             skin = &asset->mSkins[skinIndex];
         }
         const cgltf_mesh* cgltfMesh = iter.first->mesh;
